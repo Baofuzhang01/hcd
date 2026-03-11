@@ -4,6 +4,7 @@ import argparse
 import os
 import logging
 import datetime
+import threading
 from zoneinfo import ZoneInfo
 
 # 统一日志时间为北京时间，方便在 GitHub Actions 日志中查看
@@ -89,6 +90,50 @@ def _get_beijing_target_from_endtime() -> datetime.datetime:
     )
     return end_dt - datetime.timedelta(seconds=40)
     # return end_dt - datetime.timedelta(minutes=1)  # ENDTIME 前 1 分钟（60秒）
+
+def _burst_shot_worker(
+    index, offset_ms, target_dt, s, token_url,
+    times, roomid, seatid, captcha, action, results,
+    pre_token="", pre_value=""
+):
+    """定时连发（极限型）的单次提交工作线程。
+
+    在 target_dt + offset_ms 时刻提交预约，结果写入 results[index]。
+    若传入 pre_token/pre_value（主线程预取），则直接使用，跳过 GET 请求；
+    否则在发射时刻现场获取（有网络延迟）。
+    """
+    fire_dt = target_dt + datetime.timedelta(milliseconds=offset_ms)
+    while _beijing_now() < fire_dt:
+        time.sleep(0.001)
+
+    logging.info(
+        f"[burst] Shot {index + 1} firing at {_beijing_now()} (target_dt + {offset_ms}ms)"
+    )
+
+    if pre_token:
+        token, value = pre_token, pre_value
+        logging.info(f"[burst] Shot {index + 1} using pre-fetched token: {token}")
+    else:
+        token, value = s._get_page_token(token_url, require_value=True)
+        if not token:
+            logging.error(f"[burst] Shot {index + 1} failed to get page token")
+            results[index] = False
+            return
+        logging.info(f"[burst] Shot {index + 1} fetched token on-the-fly: {token}")
+
+    result = s.get_submit(
+        url=s.submit_url,
+        times=times,
+        token=token,
+        roomid=roomid,
+        seatid=seatid,
+        captcha=captcha,
+        action=action,
+        value=value,
+    )
+    results[index] = result
+    logging.info(f"[burst] Shot {index + 1} result: {result}")
+
 
 def strategic_first_attempt(
     users,
@@ -243,112 +288,185 @@ def strategic_first_attempt(
             fidEnc=fid_enc or "",
         )
 
-        if STRATEGIC_MODE == "A":
-            # 策略 A：目标时间前 PRE_FETCH_TOKEN_MS 毫秒预取 token，
-            #         目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒提交
-            pre_fetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
-            while _beijing_now() < pre_fetch_dt:
-                time.sleep(0.1)
-            logging.info(
-                f"[strategic] [A] Pre-fetch page token at {_beijing_now()} (target_dt - {PRE_FETCH_TOKEN_MS}ms)"
-            )
-            token1, value1 = s._get_page_token(_token_url, require_value=True)
-            if not token1:
-                logging.error("[strategic] Failed to get page token for first submit, skip this config")
-                continue
-            logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
+        if SUBMIT_MODE == "burst":
+            # ── 定时连发（极限型）──
+            n_shots = len(BURST_OFFSETS_MS)
+            captchas_list = [captcha1, captcha2, captcha3]
 
-            submit_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
-            while _beijing_now() < submit_dt1:
-                time.sleep(0.001)
+            if STRATEGIC_MODE == "A":
+                # 策略 A + burst：主线程在 T - PRE_FETCH_TOKEN_MS 提前串行取好 N 份 token，
+                # 线程到点直接 POST，零 GET 延迟
+                burst_prefetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
+                if _beijing_now() < burst_prefetch_dt:
+                    logging.info(
+                        f"[strategic] [burst-A] Waiting until target_dt - {PRE_FETCH_TOKEN_MS}ms "
+                        f"({burst_prefetch_dt}) to pre-fetch tokens"
+                    )
+                    while _beijing_now() < burst_prefetch_dt:
+                        time.sleep(0.05)
+
+                logging.info(
+                    f"[strategic] [burst-A] Pre-fetching {n_shots} tokens at {_beijing_now()}"
+                )
+                pre_tokens = []
+                for i in range(n_shots):
+                    pt, pv = s._get_page_token(_token_url, require_value=True)
+                    if pt:
+                        logging.info(f"[strategic] [burst-A] Pre-fetched token {i + 1}: {pt}")
+                    else:
+                        logging.warning(
+                            f"[strategic] [burst-A] Token {i + 1} pre-fetch failed, "
+                            "thread will fetch on-the-fly as fallback"
+                        )
+                    pre_tokens.append((pt, pv))
+            else:
+                # 策略 B + burst：不预取，各线程在各自的发射时刻（T + offset）自己取 token 并立即提交
+                logging.info(
+                    f"[strategic] [burst-B] No pre-fetch; each thread will fetch token "
+                    "on-the-fly at its own fire time"
+                )
+                pre_tokens = [("", "")] * n_shots
+
+            burst_results = [None] * n_shots
+            threads = []
+            for burst_i, burst_offset_ms in enumerate(BURST_OFFSETS_MS):
+                burst_cap = captchas_list[burst_i] if burst_i < len(captchas_list) else ""
+                pt, pv = pre_tokens[burst_i] if burst_i < len(pre_tokens) else ("", "")
+                t = threading.Thread(
+                    target=_burst_shot_worker,
+                    args=(
+                        burst_i, burst_offset_ms, target_dt, s, _token_url,
+                        times, roomid, first_seat, burst_cap, action, burst_results,
+                        pt, pv,
+                    ),
+                    daemon=True,
+                    name=f"burst-shot-{burst_i + 1}",
+                )
+                threads.append(t)
+
             logging.info(
-                f"[strategic] [A] First submit at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
+                f"[strategic] [burst] Launching {len(threads)} shots at offsets "
+                f"{BURST_OFFSETS_MS} ms from target_dt"
             )
-            suc = s.get_submit(
-                url=s.submit_url,
-                times=times,
-                token=token1,
-                roomid=roomid,
-                seatid=first_seat,
-                captcha=captcha1,
-                action=action,
-                value=value1,
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+            suc = any(r for r in burst_results if r)
+            logging.info(
+                f"[strategic] [burst] All shots done, results: {burst_results}, overall success: {suc}"
             )
 
         else:
-            # 策略 B：目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒获取 token 并立即提交
-            token_fetch_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
-            while _beijing_now() < token_fetch_dt1:
-                time.sleep(0.001)
-            logging.info(
-                f"[strategic] [B] Fetch page token at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
-            )
-            token1, value1 = s._get_page_token(_token_url, require_value=True)
-            if not token1:
-                logging.error("[strategic] Failed to get page token for first submit, skip this config")
-                continue
-            logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
-            logging.info(f"[strategic] [B] Immediately submit after fetching page token")
-            suc = s.get_submit(
-                url=s.submit_url,
-                times=times,
-                token=token1,
-                roomid=roomid,
-                seatid=first_seat,
-                captcha=captcha1,
-                action=action,
-                value=value1,
-            )
-
-        # 如果第一次没有成功：为第二次提交重新获取页面 token，再延迟 TARGET_OFFSET2_MS 毫秒提交
-        if not suc:
-            logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
-
-            token2, value2 = s._get_page_token(_token_url, require_value=True)
-            if not token2:
-                logging.error("[strategic] Failed to get page token for second submit, skip to third/normal flow")
-            else:
-                send_dt2 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET2_MS)
-                while _beijing_now() < send_dt2:
-                    time.sleep(0.02)
+            # ── 串行重试（稳健型）──
+            # 每枪等到 HTTP 响应后，失败才发下一枪
+            if STRATEGIC_MODE == "A":
+                # 策略 A：目标时间前 PRE_FETCH_TOKEN_MS 毫秒预取 token，
+                #         目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒提交
+                pre_fetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
+                while _beijing_now() < pre_fetch_dt:
+                    time.sleep(0.1)
                 logging.info(
-                    f"[strategic] Second submit at {send_dt2} (now + {TARGET_OFFSET2_MS}ms) with NEW page token"
+                    f"[strategic] [A] Pre-fetch page token at {_beijing_now()} (target_dt - {PRE_FETCH_TOKEN_MS}ms)"
+                )
+                token1, value1 = s._get_page_token(_token_url, require_value=True)
+                if not token1:
+                    logging.error("[strategic] Failed to get page token for first submit, skip this config")
+                    continue
+                logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
+
+                submit_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
+                while _beijing_now() < submit_dt1:
+                    time.sleep(0.001)
+                logging.info(
+                    f"[strategic] [A] First submit at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
                 suc = s.get_submit(
                     url=s.submit_url,
                     times=times,
-                    token=token2,
+                    token=token1,
                     roomid=roomid,
                     seatid=first_seat,
-                    captcha=captcha2,
+                    captcha=captcha1,
                     action=action,
-                    value=value2,
+                    value=value1,
                 )
 
-        # 如果第二次仍未成功：为第三次提交再次获取新的 token，再延迟 TARGET_OFFSET3_MS 毫秒提交
-        if not suc:
-            logging.info("[strategic] Second submit failed, prepare third submit with NEW page token")
-
-            token3, value3 = s._get_page_token(_token_url, require_value=True)
-            if not token3:
-                logging.error("[strategic] Failed to get page token for third submit, give up strategic submits for this config")
             else:
-                send_dt3 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET3_MS)
-                while _beijing_now() < send_dt3:
-                    time.sleep(0.02)
+                # 策略 B：目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒获取 token 并立即提交
+                token_fetch_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
+                while _beijing_now() < token_fetch_dt1:
+                    time.sleep(0.001)
                 logging.info(
-                    f"[strategic] Third submit at {send_dt3} (now + {TARGET_OFFSET3_MS}ms) with NEW page token"
+                    f"[strategic] [B] Fetch page token at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
+                token1, value1 = s._get_page_token(_token_url, require_value=True)
+                if not token1:
+                    logging.error("[strategic] Failed to get page token for first submit, skip this config")
+                    continue
+                logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
+                logging.info(f"[strategic] [B] Immediately submit after fetching page token")
                 suc = s.get_submit(
                     url=s.submit_url,
                     times=times,
-                    token=token3,
+                    token=token1,
                     roomid=roomid,
                     seatid=first_seat,
-                    captcha=captcha3,
+                    captcha=captcha1,
                     action=action,
-                    value=value3,
+                    value=value1,
                 )
+
+            # 如果第一次没有成功：为第二次提交重新获取页面 token，再延迟 TARGET_OFFSET2_MS 毫秒提交
+            if not suc:
+                logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
+
+                token2, value2 = s._get_page_token(_token_url, require_value=True)
+                if not token2:
+                    logging.error("[strategic] Failed to get page token for second submit, skip to third/normal flow")
+                else:
+                    send_dt2 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET2_MS)
+                    while _beijing_now() < send_dt2:
+                        time.sleep(0.02)
+                    logging.info(
+                        f"[strategic] Second submit at {send_dt2} (now + {TARGET_OFFSET2_MS}ms) with NEW page token"
+                    )
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token2,
+                        roomid=roomid,
+                        seatid=first_seat,
+                        captcha=captcha2,
+                        action=action,
+                        value=value2,
+                    )
+
+            # 如果第二次仍未成功：为第三次提交再次获取新的 token，再延迟 TARGET_OFFSET3_MS 毫秒提交
+            if not suc:
+                logging.info("[strategic] Second submit failed, prepare third submit with NEW page token")
+
+                token3, value3 = s._get_page_token(_token_url, require_value=True)
+                if not token3:
+                    logging.error("[strategic] Failed to get page token for third submit, give up strategic submits for this config")
+                else:
+                    send_dt3 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET3_MS)
+                    while _beijing_now() < send_dt3:
+                        time.sleep(0.02)
+                    logging.info(
+                        f"[strategic] Third submit at {send_dt3} (now + {TARGET_OFFSET3_MS}ms) with NEW page token"
+                    )
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token3,
+                        roomid=roomid,
+                        seatid=first_seat,
+                        captcha=captcha3,
+                        action=action,
+                        value=value3,
+                    )
 
         success_list[index] = suc
 
@@ -676,14 +794,38 @@ if __name__ == "__main__":
         usersdata = config["reserve"]
 
         # 从 config.json 读取所有策略参数（唯一配置来源）
+        # ┌─────────────────────────────────────────────────────────────────────┐
+        # │  mode (STRATEGIC_MODE) × submit_mode (SUBMIT_MODE) 四种组合         │
+        # ├──────────┬────────────┬──────────────────────────────────────────────┤
+        # │ mode=A   │ serial     │ T-pre_fetch_token_ms 预取token1              │
+        # │          │            │ → T+first_submit_offset_ms POST，等结果       │
+        # │          │            │ → 失败则现取token2，+offset2 POST，等结果      │
+        # │          │            │ → 失败则现取token3，+offset3 POST             │
+        # ├──────────┼────────────┼──────────────────────────────────────────────┤
+        # │ mode=A   │ burst ★   │ T-pre_fetch_token_ms 预取token1/2/3           │
+        # │          │            │ → T+burst[0] thread-1 直接POST（零GET延迟）   │
+        # │          │            │ → T+burst[1] thread-2 直接POST（零GET延迟）   │
+        # │          │            │ → T+burst[2] thread-3 直接POST（零GET延迟）   │
+        # ├──────────┼────────────┼──────────────────────────────────────────────┤
+        # │ mode=B   │ serial     │ T+first_submit_offset_ms 取token1并POST，等结果│
+        # │ (默认)   │ (默认)     │ → 失败则现取token2，+offset2 POST，等结果      │
+        # │          │            │ → 失败则现取token3，+offset3 POST             │
+        # ├──────────┼────────────┼──────────────────────────────────────────────┤
+        # │ mode=B   │ burst      │ T+burst[0] thread-1 自取token并POST           │
+        # │          │            │ T+burst[1] thread-2 自取token并POST           │
+        # │          │            │ T+burst[2] thread-3 自取token并POST           │
+        # │          │            │ 注意：实际POST = burst[i] + GET网络延迟        │
+        # └──────────┴────────────┴──────────────────────────────────────────────┘
         strategy_cfg = config.get("strategy", {})
         STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 18))
         STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
-        STRATEGIC_MODE               = strategy_cfg.get("mode", "B")
-        PRE_FETCH_TOKEN_MS           = int(strategy_cfg.get("pre_fetch_token_ms", 3000))
-        FIRST_SUBMIT_OFFSET_MS       = int(strategy_cfg.get("first_submit_offset_ms", 89))
-        TARGET_OFFSET2_MS            = int(strategy_cfg.get("target_offset2_ms", 150))
-        TARGET_OFFSET3_MS            = int(strategy_cfg.get("target_offset3_ms", 160))
+        STRATEGIC_MODE               = strategy_cfg.get("mode", "B")             # "A" | "B"
+        PRE_FETCH_TOKEN_MS           = int(strategy_cfg.get("pre_fetch_token_ms", 3000))   # 仅 mode=A
+        FIRST_SUBMIT_OFFSET_MS       = int(strategy_cfg.get("first_submit_offset_ms", 89)) # mode=A: 提交延迟; mode=B: 取token延迟
+        TARGET_OFFSET2_MS            = int(strategy_cfg.get("target_offset2_ms", 150))     # 仅 serial
+        TARGET_OFFSET3_MS            = int(strategy_cfg.get("target_offset3_ms", 160))     # 仅 serial
+        SUBMIT_MODE                  = strategy_cfg.get("submit_mode", "serial")  # "serial" | "burst"
+        BURST_OFFSETS_MS             = strategy_cfg.get("burst_offsets_ms", [120, 420, 820])  # 仅 burst
 
         # 控制是否在每一轮主循环中都重新登录
         RELOGIN_EVERY_LOOP = bool(config.get("relogin_every_loop", RELOGIN_EVERY_LOOP))
