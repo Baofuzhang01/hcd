@@ -187,6 +187,128 @@ async function dispatchGitHub(token, repo, payload) {
   }
 }
 
+// ─── 创建并初始化 GitHub 仓库（内容复制自 hcd）───
+const SOURCE_REPO_NAME = "hcd";
+
+async function createAndInitRepo(repoFullName, ghToken) {
+  const parts = repoFullName.split("/");
+  if (parts.length !== 2) throw new Error(`仓库格式错误: ${repoFullName}，应为 owner/repo`);
+  const [owner, repoName] = parts;
+
+  // 源仓库与目标相同则跳过
+  if (repoName === SOURCE_REPO_NAME) return { ok: true, skipped: true, reason: "目标即源仓库，跳过" };
+
+  const ghHeaders = {
+    Authorization: `Bearer ${ghToken}`,
+    Accept: "application/vnd.github+json",
+    "Content-Type": "application/json",
+    "User-Agent": "TongYi-Worker",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+
+  // Step 1: 创建新仓库（空，不自动初始化）
+  const createResp = await fetch("https://api.github.com/user/repos", {
+    method: "POST",
+    headers: ghHeaders,
+    body: JSON.stringify({
+      name: repoName,
+      private: false,
+      auto_init: false,
+      description: `ChaoXing seat reservation - ${repoName}`,
+    }),
+  });
+  const alreadyExists = createResp.status === 422;
+  if (!createResp.ok && !alreadyExists) {
+    const err = await createResp.text();
+    throw new Error(`创建仓库失败 (${createResp.status}): ${err}`);
+  }
+
+  // Step 2: 获取源仓库 hcd 的完整文件树
+  const treeResp = await fetch(
+    `https://api.github.com/repos/${owner}/${SOURCE_REPO_NAME}/git/trees/HEAD?recursive=1`,
+    { headers: ghHeaders }
+  );
+  if (!treeResp.ok) throw new Error(`获取源仓库文件树失败: ${treeResp.status}`);
+  const { tree: sourceTree } = await treeResp.json();
+  const blobs = sourceTree.filter((item) => item.type === "blob");
+
+  // Step 3: 逐个复制 blob 到新仓库
+  const newTreeEntries = [];
+  for (const item of blobs) {
+    const blobResp = await fetch(
+      `https://api.github.com/repos/${owner}/${SOURCE_REPO_NAME}/git/blobs/${item.sha}`,
+      { headers: ghHeaders }
+    );
+    if (!blobResp.ok) continue;
+    const blobData = await blobResp.json();
+
+    const newBlobResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/blobs`,
+      {
+        method: "POST",
+        headers: ghHeaders,
+        body: JSON.stringify({ content: blobData.content, encoding: blobData.encoding }),
+      }
+    );
+    if (!newBlobResp.ok) continue;
+    const { sha: newSha } = await newBlobResp.json();
+    newTreeEntries.push({ path: item.path, mode: item.mode, type: "blob", sha: newSha });
+  }
+
+  // Step 4: 在新仓库创建 tree
+  const newTreeResp = await fetch(
+    `https://api.github.com/repos/${owner}/${repoName}/git/trees`,
+    {
+      method: "POST",
+      headers: ghHeaders,
+      body: JSON.stringify({ tree: newTreeEntries }),
+    }
+  );
+  if (!newTreeResp.ok) throw new Error(`创建 tree 失败: ${newTreeResp.status}`);
+  const { sha: newTreeSha } = await newTreeResp.json();
+
+  // Step 5: 创建初始 commit（无父节点）
+  const newCommitResp = await fetch(
+    `https://api.github.com/repos/${owner}/${repoName}/git/commits`,
+    {
+      method: "POST",
+      headers: ghHeaders,
+      body: JSON.stringify({
+        message: `init: copy from ${owner}/${SOURCE_REPO_NAME}`,
+        tree: newTreeSha,
+      }),
+    }
+  );
+  if (!newCommitResp.ok) throw new Error(`创建 commit 失败: ${newCommitResp.status}`);
+  const { sha: newCommitSha } = await newCommitResp.json();
+
+  // Step 6: 创建或更新 main 分支
+  const refResp = await fetch(
+    `https://api.github.com/repos/${owner}/${repoName}/git/refs`,
+    {
+      method: "POST",
+      headers: ghHeaders,
+      body: JSON.stringify({ ref: "refs/heads/main", sha: newCommitSha }),
+    }
+  );
+  if (refResp.status === 422) {
+    // 分支已存在，强制更新
+    const patchResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/refs/heads/main`,
+      {
+        method: "PATCH",
+        headers: ghHeaders,
+        body: JSON.stringify({ sha: newCommitSha, force: true }),
+      }
+    );
+    if (!patchResp.ok) throw new Error(`更新 main 分支失败: ${patchResp.status}`);
+  } else if (!refResp.ok) {
+    throw new Error(`创建 main 分支失败: ${refResp.status}`);
+  }
+
+  return { ok: true, repo: `${owner}/${repoName}`, files: newTreeEntries.length };
+}
+
 const BATCH_SIZE = 20;
 
 function chunkArray(arr, size) {
@@ -303,7 +425,16 @@ async function handleAPI(request, env, path) {
       schools.push(id);
       await saveSchools(KV, schools);
     }
-    return jsonResp({ ok: true, school });
+    // 自动在 GitHub 创建仓库并从 hcd 复制代码
+    let repoInit = null;
+    if (school.repo && env.GH_TOKEN) {
+      try {
+        repoInit = await createAndInitRepo(school.repo, env.GH_TOKEN);
+      } catch (e) {
+        repoInit = { ok: false, error: e.message };
+      }
+    }
+    return jsonResp({ ok: true, school, repoInit });
   }
 
   // GET /api/school/:id
@@ -981,7 +1112,17 @@ async function doAddSchool() {
   if (!id || !name) return toast("请填写必要信息", "error");
   const res = await api("POST", "/api/school", { id, name, repo, trigger_time, endtime });
   if (res.ok) {
-    toast("学校添加成功");
+    let msg = "学校添加成功";
+    if (res.repoInit) {
+      if (res.repoInit.skipped) {
+        msg += "（仓库已是源仓库，跳过初始化）";
+      } else if (res.repoInit.ok) {
+        msg += "，已创建仓库并复制 " + res.repoInit.files + " 个文件";
+      } else {
+        msg += "，但仓库初始化失败: " + res.repoInit.error;
+      }
+    }
+    toast(msg);
     closeModal("addSchoolModal");
     loadSchools();
   } else {
