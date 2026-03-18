@@ -199,6 +199,7 @@ class reserve:
             method: "GET" 或 "POST"，允许按前端实现切换请求方式
             data: 当使用 POST 时提交的表单数据
         """
+        logging.info(f"Token fetch URL: {url}")
         try:
             if method.upper() == "POST":
                 response = self._post(
