@@ -5,7 +5,6 @@ import os
 import logging
 import datetime
 import threading
-import random
 from zoneinfo import ZoneInfo
 
 # 统一日志时间为北京时间，方便在 GitHub Actions 日志中查看
@@ -62,34 +61,38 @@ def _format_seat_number(seat_num: int) -> str:
     return f"{seat_num:03d}"
 
 
-def _pick_random_fallback_seat(
+def _pick_ordered_fallback_seat(
     base_seat_num: int,
+    attempt_no: int,
     used_seats: set[str] | None = None,
-) -> tuple[str, str]:
-    """生成补抢座位号。
+) -> tuple[str | None, str]:
+    """按固定顺序生成补抢座位号。
 
-    - 当前座位号 >= 50: 在 [1, 当前座位号] 随机
-    - 当前座位号 < 50: 在 [0, 100] 随机
-    - 同一配置的补抢窗口内优先不重复抽已尝试过的座位
-    返回三位数字符串和区间说明。
+    顺序为：
+    第 1 轮: +1
+    第 2 轮: -1
+    第 3 轮: +2
+    第 4 轮: -2
+    ...
+    第 9 轮: +5
+    第 10 轮: -5
+
+    返回三位数字符串和本轮偏移说明；如果座位号无效或已用过，则返回 (None, offset)。
     """
-    if base_seat_num < 50:
-        candidates = list(range(0, 101))
-        source_range = "0-100"
-    else:
-        candidates = list(range(1, base_seat_num + 1))
-        source_range = f"1-{base_seat_num}"
+    distance = (attempt_no + 1) // 2
+    direction = 1 if attempt_no % 2 == 1 else -1
+    offset = direction * distance
+    seat_num = base_seat_num + offset
+    formatted_offset = f"{offset:+d}"
 
-    if used_seats:
-        remaining = [
-            seat_num for seat_num in candidates
-            if _format_seat_number(seat_num) not in used_seats
-        ]
-        if remaining:
-            candidates = remaining
+    if seat_num <= 0:
+        return None, formatted_offset
 
-    seat_num = random.choice(candidates)
-    return _format_seat_number(seat_num), source_range
+    formatted_seat = _format_seat_number(seat_num)
+    if used_seats and formatted_seat in used_seats:
+        return None, formatted_offset
+
+    return formatted_seat, formatted_offset
 
 
 ENDTIME = "20:00:40"  # 根据学校的预约座位时间+40ms即可
@@ -100,13 +103,15 @@ ENABLE_TEXTCLICK = False  # 是否有选字验证码（需要图灵云打码平�
 
 MAX_ATTEMPT = 1
 SLEEPTIME = 0.05  # 每次抢座的间隔（减少到0.05秒以加快速度）
+WARM_CONNECTION_LEAD_MS = 2400  # 连接预热提前量（毫秒）
+FIRST_TOKEN_DATE_MODE = "submit_date"  # 首次取 token 的日期：today 或 submit_date
 
 
 # 是否在每一轮主循环中都重新登录。
 # True：每一轮都会重新创建会话并登录（原有行为）；
 # False：每个账号只在第一次需要时登录一次，后续循环复用同一个会话。
 RELOGIN_EVERY_LOOP = True
-MAX_SEAT_INCREMENT_ATTEMPTS = 4
+MAX_SEAT_INCREMENT_ATTEMPTS = 10
 
 
 def _normalize_times(times):
@@ -195,6 +200,8 @@ def _apply_strategy_config(config):
     global SUBMIT_MODE
     global BURST_OFFSETS_MS
     global TOKEN_FETCH_DELAY_MS
+    global WARM_CONNECTION_LEAD_MS
+    global FIRST_TOKEN_DATE_MODE
 
     strategy_cfg = config.get("strategy", {})
     ENDTIME = config.get("endtime", ENDTIME)
@@ -208,7 +215,26 @@ def _apply_strategy_config(config):
     SUBMIT_MODE = strategy_cfg.get("submit_mode", "serial")
     BURST_OFFSETS_MS = strategy_cfg.get("burst_offsets_ms", [120, 420, 820])
     TOKEN_FETCH_DELAY_MS = int(strategy_cfg.get("token_fetch_delay_ms", 50))
+    WARM_CONNECTION_LEAD_MS = int(
+        strategy_cfg.get("warm_connection_lead_ms", WARM_CONNECTION_LEAD_MS)
+    )
+    first_token_date_mode = str(
+        strategy_cfg.get("first_token_date_mode", FIRST_TOKEN_DATE_MODE)
+    ).strip().lower()
+    FIRST_TOKEN_DATE_MODE = (
+        first_token_date_mode if first_token_date_mode in {"today", "submit_date"} else "submit_date"
+    )
     RELOGIN_EVERY_LOOP = bool(config.get("relogin_every_loop", RELOGIN_EVERY_LOOP))
+
+
+def _get_first_token_day(
+    warm_day: datetime.date,
+    submit_day: datetime.date,
+) -> datetime.date:
+    """返回首次取 token 使用的日期。"""
+    if FIRST_TOKEN_DATE_MODE == "today":
+        return warm_day
+    return submit_day
 
 
 def _get_beijing_target_from_endtime() -> datetime.datetime:
@@ -266,14 +292,21 @@ def _burst_shot_worker(
 
     if pre_token:
         token, value = pre_token, pre_value
-        logging.info(f"[burst] Shot {index + 1} using pre-fetched token: {token}")
+        logging.info(
+            f"[burst] Shot {index + 1} using pre-fetched token from {token_url}: {token}"
+        )
     else:
-        token, value = s._get_page_token(token_url, require_value=True)
+        token, value = s._get_page_token(
+            token_url,
+            require_value=True,
+        )
         if not token:
             logging.error(f"[burst] Shot {index + 1} failed to get page token")
             results[index] = False
             return
-        logging.info(f"[burst] Shot {index + 1} fetched token on-the-fly: {token}")
+        logging.info(
+            f"[burst] Shot {index + 1} fetched token on-the-fly from {token_url}: {token}"
+        )
 
     result = s.get_submit(
         url=s.submit_url,
@@ -332,6 +365,7 @@ def strategic_first_attempt(
     warm_done = False
     shared_strategy_session = None
     shared_strategy_username = None
+    not_open_retry_until = target_dt + datetime.timedelta(milliseconds=1300)
 
     for index, user in enumerate(users):
         # 已经成功的配置不再参与策略尝试
@@ -572,30 +606,41 @@ def strategic_first_attempt(
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
 
-        # token URL 供所有 3 次提交复用
-        # 使用当天日期获取页面 token，避免预约日尚未开放导致页面报错拿不到 submit_enc
-        _token_day = _beijing_now().date()
-        _token_url = s.url.format(
+        # 预热 URL 保持使用当天页面，只用于建立连接，不参与真正提交。
+        _warm_day = _beijing_now().date()
+        _warm_url = s.url.format(
             roomId=roomid,
-            day=str(_token_day),
+            day=str(_warm_day),
+            seatPageId=seat_page_id or "",
+            fidEnc=fid_enc or "",
+        )
+
+        # 真正提交通常使用预约日页面；首次取 token 允许按策略改为当天页面。
+        _submit_day = _warm_day + datetime.timedelta(days=1 if RESERVE_NEXT_DAY else 0)
+        _first_token_day = _get_first_token_day(_warm_day, _submit_day)
+        _first_token_url = s.url.format(
+            roomId=roomid,
+            day=str(_first_token_day),
+            seatPageId=seat_page_id or "",
+            fidEnc=fid_enc or "",
+        )
+        _submit_token_url = s.url.format(
+            roomId=roomid,
+            day=str(_submit_day),
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
 
         # 连接预热：只有首个配置执行一次，后续配置直接复用已预热的连接池
         if is_primary_strategy_config and not warm_done:
-            if _beijing_now() >= target_dt:
-                logging.info("[warm] Skip warm-up because target time reached, enter submit flow directly")
-            else:
-                warm_dt = target_dt - datetime.timedelta(seconds=5)
+            if _beijing_now() < target_dt:
+                warm_dt = target_dt - datetime.timedelta(
+                    milliseconds=WARM_CONNECTION_LEAD_MS
+                )
                 while _beijing_now() < warm_dt:
                     time.sleep(0.05)
-                s.warm_connection(_token_url)
+                s.warm_connection(_warm_url)
                 warm_done = True
-        elif not is_primary_strategy_config:
-            logging.info("[warm] Reuse existing pre-warmed connection for this config")
-        else:
-            logging.info("[warm] Skip redundant warm-up for this config")
 
         if SUBMIT_MODE == "burst":
             # ── 定时连发（极限型）──
@@ -609,11 +654,11 @@ def strategic_first_attempt(
                     time.sleep(0.001)
                 logging.info(
                     f"[strategic] [burst-C] Fetching single reusable token at {_beijing_now()} "
-                    f"(target_dt + {TOKEN_FETCH_DELAY_MS}ms)"
+                    f"(target_dt + {TOKEN_FETCH_DELAY_MS}ms) from {_first_token_url}"
                 )
-                pt, pv = s._get_page_token(_token_url, require_value=True)
+                pt, pv = s._get_page_token(_first_token_url, require_value=True)
                 if pt:
-                    logging.info(f"[strategic] [burst-C] Got token: {pt}")
+                    logging.info(f"[strategic] [burst-C] Got token from {_first_token_url}: {pt}")
                 else:
                     logging.warning("[strategic] [burst-C] Token fetch failed, threads will fetch on-the-fly")
                 pre_tokens = [(pt, pv)] * n_shots
@@ -631,11 +676,11 @@ def strategic_first_attempt(
                         time.sleep(0.05)
 
                 logging.info(
-                    f"[strategic] [burst-A] Pre-fetching 1 shared token at {_beijing_now()}"
+                    f"[strategic] [burst-A] Pre-fetching 1 shared token at {_beijing_now()} from {_first_token_url}"
                 )
-                pt, pv = s._get_page_token(_token_url, require_value=True)
+                pt, pv = s._get_page_token(_first_token_url, require_value=True)
                 if pt:
-                    logging.info(f"[strategic] [burst-A] Pre-fetched shared token: {pt}")
+                    logging.info(f"[strategic] [burst-A] Pre-fetched shared token from {_first_token_url}: {pt}")
                 else:
                     logging.warning(
                         "[strategic] [burst-A] Token pre-fetch failed, "
@@ -658,7 +703,7 @@ def strategic_first_attempt(
                 t = threading.Thread(
                     target=_burst_shot_worker,
                     args=(
-                        burst_i, burst_offset_ms, target_dt, s, _token_url,
+                        burst_i, burst_offset_ms, target_dt, s, _submit_token_url,
                         times, roomid, first_seat, burst_cap, action, burst_results,
                         pt, pv,
                     ),
@@ -691,13 +736,18 @@ def strategic_first_attempt(
                     time.sleep(0.001)
                 logging.info(
                     f"[strategic] [C] Fetching token at {_beijing_now()} "
-                    f"(target_dt + {TOKEN_FETCH_DELAY_MS}ms)"
+                    f"(target_dt + {TOKEN_FETCH_DELAY_MS}ms) from {_first_token_url}"
                 )
-                token1, value1 = s._get_page_token(_token_url, require_value=True)
+                token1, value1 = s._get_page_token(
+                    _first_token_url,
+                    require_value=True,
+                    not_open_retry_until=not_open_retry_until,
+                    not_open_retry_interval=0.005,
+                )
                 if not token1:
                     logging.error("[strategic] [C] Token fetch failed, skip this config")
                     continue
-                logging.info(f"[strategic] [C] Got token: {token1}, immediately submit")
+                logging.info(f"[strategic] [C] Got token from {_first_token_url}: {token1}, immediately submit")
                 suc = s.get_submit(
                     url=s.submit_url,
                     times=times,
@@ -716,13 +766,20 @@ def strategic_first_attempt(
                 while _beijing_now() < pre_fetch_dt:
                     time.sleep(0.1)
                 logging.info(
-                    f"[strategic] [A] Pre-fetch page token at {_beijing_now()} (target_dt - {PRE_FETCH_TOKEN_MS}ms)"
+                    f"[strategic] [A] Pre-fetch page token at {_beijing_now()} "
+                    f"(target_dt - {PRE_FETCH_TOKEN_MS}ms) from {_first_token_url}"
                 )
-                token1, value1 = s._get_page_token(_token_url, require_value=True)
+                token1, value1 = s._get_page_token(
+                    _first_token_url,
+                    require_value=True,
+                )
                 if not token1:
                     logging.error("[strategic] Failed to get page token for first submit, skip this config")
                     continue
-                logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
+                logging.info(
+                    f"[strategic] Got page token for first submit from {_first_token_url}: "
+                    f"{token1}, value: {value1}"
+                )
 
                 submit_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
                 while _beijing_now() < submit_dt1:
@@ -749,11 +806,19 @@ def strategic_first_attempt(
                 logging.info(
                     f"[strategic] [B] Fetch page token at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
-                token1, value1 = s._get_page_token(_token_url, require_value=True)
+                token1, value1 = s._get_page_token(
+                    _first_token_url,
+                    require_value=True,
+                    not_open_retry_until=not_open_retry_until,
+                    not_open_retry_interval=0.005,
+                )
                 if not token1:
                     logging.error("[strategic] Failed to get page token for first submit, skip this config")
                     continue
-                logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
+                logging.info(
+                    f"[strategic] Got page token for first submit from {_first_token_url}: "
+                    f"{token1}, value: {value1}"
+                )
                 logging.info(f"[strategic] [B] Immediately submit after fetching page token")
                 suc = s.get_submit(
                     url=s.submit_url,
@@ -776,7 +841,10 @@ def strategic_first_attempt(
                     continue
                 logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
 
-                token2, value2 = s._get_page_token(_token_url, require_value=True)
+                token2, value2 = s._get_page_token(
+                    _submit_token_url,
+                    require_value=True,
+                )
                 if not token2:
                     logging.error("[strategic] Failed to get page token for second submit, skip to third/normal flow")
                 else:
@@ -807,7 +875,10 @@ def strategic_first_attempt(
                     continue
                 logging.info("[strategic] Second submit failed, prepare third submit with NEW page token")
 
-                token3, value3 = s._get_page_token(_token_url, require_value=True)
+                token3, value3 = s._get_page_token(
+                    _submit_token_url,
+                    require_value=True,
+                )
                 if not token3:
                     logging.error("[strategic] Failed to get page token for third submit, give up strategic submits for this config")
                 else:
@@ -1004,20 +1075,29 @@ def main(users, action=False):
             )
             strategic_done = True
 
-            # 预热三次结束后，如果仍有配置未成功，随机补位并立即继续尝试
+            # 预热三次结束后，如果仍有配置未成功，按固定顺序补位并立即继续尝试
             if success_list is not None and sum(success_list) < today_reservation_num:
                 seat_increment_attempts = 1
                 for i, user in enumerate(users):
                     if not success_list[i] and original_seatids[i] is not None \
                             and current_dayofweek in user.get("daysofweek", []):
-                        new_seat, source_range = _pick_random_fallback_seat(
-                            original_seatids[i], fallback_used_seats[i]
+                        new_seat, offset = _pick_ordered_fallback_seat(
+                            original_seatids[i],
+                            seat_increment_attempts,
+                            fallback_used_seats[i],
                         )
+                        if not new_seat:
+                            logging.info(
+                                f"[seat-ordered-after-strategic] Config {i}: skip invalid/used fallback "
+                                f"(base {original_seatids[i]}, offset {offset}, "
+                                f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
+                            )
+                            continue
                         fallback_used_seats[i].add(new_seat)
                         user["seatid"] = [new_seat]
                         logging.info(
-                            f"[seat-random-after-strategic] Config {i}: try seat {new_seat} "
-                            f"(base {original_seatids[i]}, random range {source_range}, "
+                            f"[seat-ordered-after-strategic] Config {i}: try seat {new_seat} "
+                            f"(base {original_seatids[i]}, offset {offset}, "
                             f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
                         )
                 # 递增座位后立即调用 login_and_reserve（每个座位只试一次）
@@ -1030,15 +1110,15 @@ def main(users, action=False):
                     users, usernames, passwords, action, success_list, sessions
                 )
         else:
-            # 预热结束后仍未成功：未成功配置继续随机补位尝试
+            # 预热结束后仍未成功：未成功配置继续按固定顺序补位尝试
             if success_list is not None and sum(success_list) < today_reservation_num:
                 if seat_increment_attempts >= MAX_SEAT_INCREMENT_ATTEMPTS:
                     logging.info(
-                        f"[seat-random] Reached max fallback attempts "
+                        f"[seat-ordered] Reached max fallback attempts "
                         f"{MAX_SEAT_INCREMENT_ATTEMPTS}, stop fallback seat changes"
                     )
                     print(
-                        f"random fallback stopped after {seat_increment_attempts} attempts, "
+                        f"ordered fallback stopped after {seat_increment_attempts} attempts, "
                         f"success list {success_list}"
                     )
                     return
@@ -1046,18 +1126,27 @@ def main(users, action=False):
                 for i, user in enumerate(users):
                     if not success_list[i] and original_seatids[i] is not None \
                             and current_dayofweek in user.get("daysofweek", []):
-                        new_seat, source_range = _pick_random_fallback_seat(
-                            original_seatids[i], fallback_used_seats[i]
+                        new_seat, offset = _pick_ordered_fallback_seat(
+                            original_seatids[i],
+                            seat_increment_attempts,
+                            fallback_used_seats[i],
                         )
+                        if not new_seat:
+                            logging.info(
+                                f"[seat-ordered] Config {i}: skip invalid/used fallback "
+                                f"(base {original_seatids[i]}, offset {offset}, "
+                                f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
+                            )
+                            continue
                         fallback_used_seats[i].add(new_seat)
                         user["seatid"] = [new_seat]
                         logging.info(
-                            f"[seat-random] Config {i}: try seat {new_seat} "
-                            f"(base {original_seatids[i]}, random range {source_range}, "
+                            f"[seat-ordered] Config {i}: try seat {new_seat} "
+                            f"(base {original_seatids[i]}, offset {offset}, "
                             f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
                         )
 
-                # 随机补位模式下每个座位只提交一次，失败就下一轮重新随机
+                # 固定顺序补位模式下每个座位只提交一次，失败就下一轮切换到下一个偏移
                 MAX_ATTEMPT = 1
                 if sessions is not None:
                     for s_obj in sessions:
